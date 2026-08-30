@@ -197,3 +197,4 @@ def extract_eid_from_image(image_path: str, source_file: str) -> ExtractedID:
     """
     results = extract_eids_from_source(image_path, source_file)
     return results[0]
+
