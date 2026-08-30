@@ -1,14 +1,15 @@
 """
 OCR extraction for scanned Emirates ID images and PDFs.
 
-Fully offline: uses EasyOCR (a pure Python/pip package - no system binary,
-no admin install required) with OpenCV preprocessing tuned for the busy
-security-pattern background on Emirates ID cards. EasyOCR downloads its
-recognition model files once on first run (a few hundred MB, cached under
-the user's home folder) and runs entirely locally after that - no data
-leaves the machine during ID reading, and no further downloads happen on
-later runs. The OCR_ENGINE config flag exists so this can be swapped for
-a different local or cloud engine later without touching any calling code
+Uses Tesseract OCR (via the pytesseract wrapper) with OpenCV preprocessing
+tuned for the busy security-pattern background on Emirates ID cards.
+Tesseract is a small, well-established OCR engine - unlike EasyOCR (which
+pulls in PyTorch, a multi-hundred-MB machine learning library), Tesseract
+has a tiny memory footprint, which matters on a free-tier cloud server
+with limited RAM. The system `tesseract-ocr` package is installed via
+packages.txt (see repo root) - Streamlit Community Cloud reads that file
+automatically during build. The OCR_ENGINE config flag exists so this can
+be swapped for a different engine later without touching any calling code
 - callers only depend on extract_eids_from_source().
 
 Handles two real-world shapes of input, both via the same code path:
@@ -22,7 +23,6 @@ PDF files are rendered to images (one image per page) via PyMuPDF before
 the same OCR path runs on each page.
 """
 import re
-import threading
 from pathlib import Path
 
 import cv2
@@ -32,28 +32,11 @@ from app.core.config import EID_REGEX
 from app.core.eid_utils import clean_eid, is_valid_eid
 from app.models.schemas import ExtractedID
 
-# EasyOCR's Reader loads its model into memory once and is expensive to
-# construct (a few seconds). Build it lazily on first use and reuse it
-# for every image in the batch, guarded by a lock since the app may
-# handle concurrent requests.
-_reader = None
-_reader_lock = threading.Lock()
-
 # A single ID card's ID-number line is usually much shorter than the
 # amount of stray text OCR can produce from a busy security background,
 # so anything absurdly long is almost certainly noise, not a real EID
 # line, and is skipped before regex matching to cut down false splits.
 _MAX_CANDIDATE_LEN = 40
-
-
-def _get_reader():
-    global _reader
-    if _reader is None:
-        with _reader_lock:
-            if _reader is None:
-                import easyocr  # imported lazily so app startup stays fast
-                _reader = easyocr.Reader(["en"], gpu=False, verbose=False)
-    return _reader
 
 
 def _preprocess(img: np.ndarray) -> np.ndarray:
@@ -102,11 +85,21 @@ def _pdf_to_images(path: str, dpi: int = 300):
 
 
 def _detections_for_image(img: np.ndarray):
-    """Runs OCR on one image, returns list of (text, confidence 0-100)."""
+    """Runs Tesseract OCR on one image, returns list of (text, confidence 0-100)."""
+    import pytesseract  # imported lazily so app startup stays fast
+
     processed = _preprocess(img)
-    reader = _get_reader()
-    results = reader.readtext(processed)
-    return [(text, conf * 100) for _, text, conf in results if text.strip()]
+    data = pytesseract.image_to_data(
+        processed, output_type=pytesseract.Output.DICT, config="--psm 6"
+    )
+    detections = []
+    for text, conf in zip(data["text"], data["conf"]):
+        text = text.strip()
+        # tesseract returns -1 confidence for boxes with no recognized text
+        conf = float(conf)
+        if text and conf >= 0:
+            detections.append((text, conf))
+    return detections
 
 
 def _find_eids_in_detections(detections):
@@ -130,8 +123,10 @@ def _find_eids_in_detections(detections):
 
     # fall back: some scans split "784-1999-" and "3972907-7" across two
     # separate OCR boxes - retry against the full concatenated text of
-    # the whole page/image for anything not already found.
-    full_text = "".join(t for t, _ in detections)
+    # the whole page/image for anything not already found. Tesseract
+    # returns word-level boxes in reading order, so simple concatenation
+    # (with spaces, since words are already space-separated) works.
+    full_text = " ".join(t for t, _ in detections)
     avg_conf = sum(c for _, c in detections) / len(detections) if detections else 0.0
     for match in re.finditer(EID_REGEX, full_text.replace(" ", "")):
         cleaned = clean_eid(match.group(0))
