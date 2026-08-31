@@ -20,12 +20,24 @@ HEADER_FILL = PatternFill("solid", fgColor="2F5496")
 HEADER_FONT = Font(bold=True, color="FFFFFF")
 
 
-def _write_header(ws, headers: List[str]):
-    for i, h in enumerate(headers, start=1):
-        c = ws.cell(row=1, column=i, value=h)
-        c.font = HEADER_FONT
-        c.fill = HEADER_FILL
-    ws.freeze_panes = "A2"
+def _write_header(ws_new, [
+        "EID No.", "Name (OCR)", "Date of Issue (OCR)", "Date of Expiry (OCR)",
+        "Scanned File Name", "Date Processed", "Remarks",
+    ])
+    row = 2
+    for r in results:
+        if r.status != MatchStatus.NEW_ARRIVAL:
+            continue
+        ws_new.append([
+            r.extracted_eid or "",
+            r.extracted_name,
+            r.extracted_date_of_issue,
+            r.extracted_date_of_expiry,
+            r.source_file,
+            datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            NEW_ARRIVALS_REMARK,
+        ])
+        row += 1
 
 
 def build_report_workbook(
