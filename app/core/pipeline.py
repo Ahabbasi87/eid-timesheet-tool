@@ -42,6 +42,10 @@ def run_pipeline(
     results, match_logs = match_extracted_ids(extracted, master)
     all_logs.extend(match_logs)
 
+    # 3. Match against master data (also handles dedupe)
+    results, match_logs = match_extracted_ids(extracted, master)
+    all_logs.extend(match_logs)
+
     # 4. Find every supplier sheet across all uploaded template files.
     # Each uploaded file may be a single supplier's timesheet (one
     # sheet) or a combined workbook with one tab per supplier - either
