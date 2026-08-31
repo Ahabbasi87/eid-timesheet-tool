@@ -1,3 +1,4 @@
+python
 """
 Top-level orchestration: ties together master data loading, OCR,
 matching, timesheet population, and report generation for one
@@ -12,6 +13,7 @@ from app.core.ocr_processor import extract_eids_from_source
 from app.core.report_writer import build_report_workbook, build_summary
 from app.core.timesheet_writer import (
     group_matches_by_supplier,
+    normalize_supplier,
     populate_supplier_timesheet,
     read_supplier_name,
 )
@@ -32,10 +34,7 @@ def run_pipeline(
     # 1. Load master data (read-only)
     master = load_master_data(master_data_path)
 
-    # 2. OCR every scanned ID file. Each file may contain more than one ID
-    # card (e.g. several IDs scanned onto one sheet, or a multi-page PDF),
-    # so each file can contribute more than one ExtractedID - flatten the
-    # per-file lists into one combined list for matching.
+    # 2. OCR every scanned ID file.
     extracted = []
     for path in scanned_id_paths:
         extracted.extend(extract_eids_from_source(path, Path(path).name))
@@ -44,8 +43,10 @@ def run_pipeline(
     results, match_logs = match_extracted_ids(extracted, master)
     all_logs.extend(match_logs)
 
-    # 4. Read each template's supplier (H5) and validate against master suppliers
-    template_suppliers = {}
+    # 4. Read each template's supplier (H5). Keyed by NORMALIZED text so
+    # a template still matches even if its H5 text differs from the
+    # master sheet only in case or spacing.
+    template_suppliers = {}  # normalized supplier -> (display name, template path)
     for tpath in supplier_template_paths:
         supplier = read_supplier_name(tpath)
         if not supplier:
@@ -56,31 +57,31 @@ def run_pipeline(
                 source_file=Path(tpath).name,
             ))
             continue
-        template_suppliers[supplier] = tpath
+        template_suppliers[normalize_supplier(supplier)] = (supplier, tpath)
 
-    # 5. Group matched employees by supplier
+    # 5. Group matched employees by normalized supplier
     grouped = group_matches_by_supplier(results)
 
     # 6. Populate each supplier's timesheet
     output_files = []
     timesheets_completed = 0
-    for supplier, template_path in template_suppliers.items():
-        supplier_matches = grouped.get(supplier, [])
-        out_path = output_dir / f"Timesheet_{supplier.replace(' ', '_')}.xlsx"
+    for norm_supplier, (display_supplier, template_path) in template_suppliers.items():
+        supplier_matches = grouped.get(norm_supplier, [])
+        out_path = output_dir / f"Timesheet_{display_supplier.replace(' ', '_')}.xlsx"
         write_logs = populate_supplier_timesheet(template_path, str(out_path), supplier_matches)
         all_logs.extend(write_logs)
         output_files.append(str(out_path))
         timesheets_completed += 1
 
     # 7. Flag matched employees whose supplier had no uploaded template at all
-    for supplier, matches in grouped.items():
-        if supplier not in template_suppliers:
+    for norm_supplier, matches in grouped.items():
+        if norm_supplier not in template_suppliers:
             for m in matches:
                 all_logs.append(LogEntry(
                     issue_type="Supplier mismatch",
                     message=(
                         f"Employee {m.employee.employee_name} ({m.extracted_eid}) belongs to "
-                        f"supplier '{supplier}', but no timesheet template was uploaded for that supplier."
+                        f"supplier '{m.supplier}', but no timesheet template was uploaded for that supplier."
                     ),
                     severity=LogSeverity.WARNING,
                     eid_no=m.extracted_eid,
