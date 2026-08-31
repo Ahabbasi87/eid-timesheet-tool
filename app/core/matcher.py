@@ -97,13 +97,16 @@ def match_extracted_ids(
         seen_eids[eid] = extracted.source_file
 
         # 5. Master data lookup
-        employee = master.get(eid)
-        if employee is None:
+          employee = master.get(eid)
+            if employee is None:
             results.append(MatchResult(
                 source_file=extracted.source_file,
                 extracted_eid=eid,
                 status=MatchStatus.NEW_ARRIVAL,
                 notes="EID not found in master data.",
+                extracted_name=extracted.name,
+                extracted_date_of_issue=extracted.date_of_issue,
+                extracted_date_of_expiry=extracted.date_of_expiry,
             ))
             logs.append(LogEntry(
                 issue_type="EID not found in Master Data",
