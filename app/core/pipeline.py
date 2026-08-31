@@ -1,4 +1,3 @@
-python
 """
 Top-level orchestration: ties together master data loading, OCR,
 matching, timesheet population, and report generation for one
@@ -12,10 +11,10 @@ from app.core.matcher import match_extracted_ids
 from app.core.ocr_processor import extract_eids_from_source
 from app.core.report_writer import build_report_workbook, build_summary
 from app.core.timesheet_writer import (
+    find_supplier_sheets,
     group_matches_by_supplier,
     normalize_supplier,
     populate_supplier_timesheet,
-    read_supplier_name,
 )
 from app.models.schemas import LogEntry, LogSeverity
 
@@ -43,21 +42,38 @@ def run_pipeline(
     results, match_logs = match_extracted_ids(extracted, master)
     all_logs.extend(match_logs)
 
-    # 4. Read each template's supplier (H5). Keyed by NORMALIZED text so
-    # a template still matches even if its H5 text differs from the
-    # master sheet only in case or spacing.
-    template_suppliers = {}  # normalized supplier -> (display name, template path)
+    # 4. Find every supplier sheet across all uploaded template files.
+    # Each uploaded file may be a single supplier's timesheet (one
+    # sheet) or a combined workbook with one tab per supplier - either
+    # way, every sheet with a supplier name in H5 becomes its own
+    # entry here, keyed by NORMALIZED supplier text so a template still
+    # matches even if its H5 text differs from the master sheet only in
+    # case or spacing.
+    template_suppliers = {}  # normalized supplier -> (display name, file path, sheet name)
     for tpath in supplier_template_paths:
-        supplier = read_supplier_name(tpath)
-        if not supplier:
+        sheets = find_supplier_sheets(tpath)
+        if not sheets:
             all_logs.append(LogEntry(
                 issue_type="Missing supplier name in H5",
-                message=f"Template '{Path(tpath).name}' has no supplier name in cell H5.",
+                message=f"'{Path(tpath).name}' has no supplier name in cell H5 on any sheet.",
                 severity=LogSeverity.ERROR,
                 source_file=Path(tpath).name,
             ))
             continue
-        template_suppliers[normalize_supplier(supplier)] = (supplier, tpath)
+        for sheet_name, supplier in sheets:
+            norm = normalize_supplier(supplier)
+            if norm in template_suppliers:
+                all_logs.append(LogEntry(
+                    issue_type="Duplicate supplier template",
+                    message=(
+                        f"Supplier '{supplier}' has more than one uploaded template/sheet; "
+                        f"using the first one found and ignoring the rest."
+                    ),
+                    severity=LogSeverity.WARNING,
+                    source_file=Path(tpath).name,
+                ))
+                continue
+            template_suppliers[norm] = (supplier, tpath, sheet_name)
 
     # 5. Group matched employees by normalized supplier
     grouped = group_matches_by_supplier(results)
@@ -65,10 +81,10 @@ def run_pipeline(
     # 6. Populate each supplier's timesheet
     output_files = []
     timesheets_completed = 0
-    for norm_supplier, (display_supplier, template_path) in template_suppliers.items():
+    for norm_supplier, (display_supplier, template_path, sheet_name) in template_suppliers.items():
         supplier_matches = grouped.get(norm_supplier, [])
         out_path = output_dir / f"Timesheet_{display_supplier.replace(' ', '_')}.xlsx"
-        write_logs = populate_supplier_timesheet(template_path, str(out_path), supplier_matches)
+        write_logs = populate_supplier_timesheet(template_path, sheet_name, str(out_path), supplier_matches)
         all_logs.extend(write_logs)
         output_files.append(str(out_path))
         timesheets_completed += 1
