@@ -3,24 +3,25 @@ OCR extraction for scanned Emirates ID images and PDFs.
 
 Uses Tesseract OCR (via the pytesseract wrapper) with OpenCV preprocessing
 tuned for the busy security-pattern background on Emirates ID cards.
-Tesseract is a small, well-established OCR engine - unlike EasyOCR (which
-pulls in PyTorch, a multi-hundred-MB machine learning library), Tesseract
-has a tiny memory footprint, which matters on a free-tier cloud server
-with limited RAM. The system `tesseract-ocr` package is installed via
-packages.txt (see repo root) - Streamlit Community Cloud reads that file
-automatically during build. The OCR_ENGINE config flag exists so this can
-be swapped for a different engine later without touching any calling code
-- callers only depend on extract_eids_from_source().
 
 Handles two real-world shapes of input, both via the same code path:
   - one ID card per image/page (the simple case)
-  - several ID cards scanned onto a single page/image (common when a
-    batch of physical IDs is photocopied or scanned together, e.g. a
-    2x4 grid on one sheet) - every EID pattern found on the page is
-    returned as its own ExtractedID record, tagged with which page/
-    position it came from.
+  - several ID cards scanned onto a single page/image
 PDF files are rendered to images (one image per page) via PyMuPDF before
 the same OCR path runs on each page.
+
+In addition to the EID number (which follows a rigid 15-digit pattern
+and OCRs very reliably), this module also makes a best-effort attempt
+at reading the cardholder's Name, Date of Issue, and Date of Expiry
+straight off the card - used to fill in the "New Arrivals" report for
+EIDs that don't match anything in master data. Unlike the EID number,
+these have no fixed shape, so treat them as a head start to be
+sanity-checked, not guaranteed-accurate data. Note also: for a page
+with SEVERAL ID cards scanned together, this best-effort read only
+recognises one name/date set for the whole page (it can't yet tell
+which name goes with which of several EIDs on that page) - those
+cases are still logged so nothing is silently wrong, but the name/
+date columns for multi-card pages should be filled in manually.
 """
 import re
 from pathlib import Path
@@ -32,28 +33,27 @@ from app.core.config import EID_REGEX
 from app.core.eid_utils import clean_eid, is_valid_eid
 from app.models.schemas import ExtractedID
 
-# A single ID card's ID-number line is usually much shorter than the
-# amount of stray text OCR can produce from a busy security background,
-# so anything absurdly long is almost certainly noise, not a real EID
-# line, and is skipped before regex matching to cut down false splits.
 _MAX_CANDIDATE_LEN = 40
+
+# Matches D/M/Y style dates in whatever separator the card/OCR gives us,
+# 2- or 4-digit years.
+_DATE_PATTERN = re.compile(r"(\d{1,2})[/.\-](\d{1,2})[/.\-](\d{2,4})")
+
+_ISSUE_LABELS = ("issuing", "issue")
+_EXPIRY_LABELS = ("expiry", "exp")
+_NAME_LABELS = ("name",)
+_NAME_STOP_WORDS = {"nationality", "date", "sex", "signature", "occupation", "employer"}
 
 
 def _preprocess(img: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
-
-    # upscale small scans - improves digit recognition significantly
     h, w = gray.shape
     if max(h, w) < 2000:
         scale = 2000 / max(h, w)
         gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-
-    # denoise the security-pattern background, then sharpen contrast
     denoised = cv2.fastNlMeansDenoising(gray, h=15)
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     contrast = clahe.apply(denoised)
-
-    # adaptive threshold works better than global threshold on ID card glare
     thresh = cv2.adaptiveThreshold(
         contrast, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 11
     )
@@ -68,8 +68,7 @@ def _load_image(path: str) -> np.ndarray:
 
 
 def _pdf_to_images(path: str, dpi: int = 300):
-    """Render every page of a PDF to a BGR numpy image (OpenCV format)."""
-    import fitz  # PyMuPDF - pure pip package, no poppler/system install needed
+    import fitz  # PyMuPDF
 
     doc = fitz.open(path)
     zoom = dpi / 72.0
@@ -85,8 +84,7 @@ def _pdf_to_images(path: str, dpi: int = 300):
 
 
 def _detections_for_image(img: np.ndarray):
-    """Runs Tesseract OCR on one image, returns list of (text, confidence 0-100)."""
-    import pytesseract  # imported lazily so app startup stays fast
+    import pytesseract
 
     processed = _preprocess(img)
     data = pytesseract.image_to_data(
@@ -95,7 +93,6 @@ def _detections_for_image(img: np.ndarray):
     detections = []
     for text, conf in zip(data["text"], data["conf"]):
         text = text.strip()
-        # tesseract returns -1 confidence for boxes with no recognized text
         conf = float(conf)
         if text and conf >= 0:
             detections.append((text, conf))
@@ -103,12 +100,6 @@ def _detections_for_image(img: np.ndarray):
 
 
 def _find_eids_in_detections(detections):
-    """
-    Scans every OCR-detected text fragment for EID-shaped substrings.
-    Returns a list of (cleaned_eid, confidence) - one entry per distinct
-    EID pattern found, so a page with several ID cards yields several
-    entries instead of just the first match.
-    """
     found = []
     seen = set()
     for text, conf in detections:
@@ -121,11 +112,6 @@ def _find_eids_in_detections(detections):
                 seen.add(cleaned)
                 found.append((cleaned, round(conf, 1)))
 
-    # fall back: some scans split "784-1999-" and "3972907-7" across two
-    # separate OCR boxes - retry against the full concatenated text of
-    # the whole page/image for anything not already found. Tesseract
-    # returns word-level boxes in reading order, so simple concatenation
-    # (with spaces, since words are already space-separated) works.
     full_text = " ".join(t for t, _ in detections)
     avg_conf = sum(c for _, c in detections) / len(detections) if detections else 0.0
     for match in re.finditer(EID_REGEX, full_text.replace(" ", "")):
@@ -137,6 +123,60 @@ def _find_eids_in_detections(detections):
     return found
 
 
+def _normalize_date(raw_match) -> str:
+    d, mo, y = raw_match.groups()
+    if len(y) == 2:
+        y = "20" + y
+    try:
+        return f"{int(d):02d}/{int(mo):02d}/{y}"
+    except ValueError:
+        return ""
+
+
+def _find_date_near(tokens, start_idx, window=6) -> str:
+    """Look forward from start_idx for the first date-shaped token."""
+    for j in range(start_idx, min(start_idx + window, len(tokens))):
+        m = _DATE_PATTERN.search(tokens[j])
+        if m:
+            date_str = _normalize_date(m)
+            if date_str:
+                return date_str
+    return ""
+
+
+def _extract_card_details(detections) -> dict:
+    """
+    Best-effort read of Name, Date of Issue, and Date of Expiry from the
+    OCR'd text of one card image. Looks for the card's own English
+    labels ("Name", "Issuing Date", "Expiry Date") and reads the value
+    that follows. Returns "" for anything it isn't confident finding -
+    callers should treat blanks as "needs manual entry", not an error.
+    """
+    tokens = [t for t, _ in detections]
+    lower_tokens = [t.lower().strip(":") for t in tokens]
+    details = {"name": "", "date_of_issue": "", "date_of_expiry": ""}
+
+    for i, tok in enumerate(lower_tokens):
+        if not details["date_of_issue"] and any(tok.startswith(l) for l in _ISSUE_LABELS):
+            details["date_of_issue"] = _find_date_near(tokens, i + 1)
+        if not details["date_of_expiry"] and any(tok.startswith(l) for l in _EXPIRY_LABELS):
+            details["date_of_expiry"] = _find_date_near(tokens, i + 1)
+        if not details["name"] and tok in _NAME_LABELS:
+            name_parts = []
+            for j in range(i + 1, min(i + 6, len(tokens))):
+                nxt_lower = lower_tokens[j]
+                if _DATE_PATTERN.search(tokens[j]) or nxt_lower in _NAME_STOP_WORDS:
+                    break
+                if re.fullmatch(r"[A-Za-z.'\-]+", tokens[j]):
+                    name_parts.append(tokens[j])
+                else:
+                    break
+            if name_parts:
+                details["name"] = " ".join(name_parts)
+
+    return details
+
+
 def _extract_from_single_image(img: np.ndarray, source_file: str, page_label: str = ""):
     label = f"{source_file}{page_label}"
     try:
@@ -146,9 +186,10 @@ def _extract_from_single_image(img: np.ndarray, source_file: str, page_label: st
 
     eids = _find_eids_in_detections(detections)
     full_text = " ".join(t for t, _ in detections)
+    card_details = _extract_card_details(detections)
 
     if not eids:
-        return [ExtractedID(source_file=label, raw_ocr_text=full_text)]
+        return [ExtractedID(source_file=label, raw_ocr_text=full_text, **card_details)]
 
     results = []
     for i, (eid, conf) in enumerate(eids, start=1):
@@ -158,19 +199,14 @@ def _extract_from_single_image(img: np.ndarray, source_file: str, page_label: st
             raw_ocr_text=full_text,
             cleaned_eid=eid,
             ocr_confidence=conf,
+            name=card_details["name"],
+            date_of_issue=card_details["date_of_issue"],
+            date_of_expiry=card_details["date_of_expiry"],
         ))
     return results
 
 
 def extract_eids_from_source(path: str, source_file: str):
-    """
-    Runs OCR against one uploaded file - a single-card image, a
-    multi-card image, or a (possibly multi-page, possibly multi-card-
-    per-page) PDF - and returns a list of ExtractedID, one per ID card
-    found. Does NOT raise on OCR/read failure - failures are represented
-    as a single ExtractedID with no cleaned_eid so the caller can log
-    them, per the "never silently ignore an error" rule.
-    """
     suffix = Path(path).suffix.lower()
     try:
         if suffix == ".pdf":
@@ -190,11 +226,5 @@ def extract_eids_from_source(path: str, source_file: str):
 
 
 def extract_eid_from_image(image_path: str, source_file: str) -> ExtractedID:
-    """
-    Back-compat single-result wrapper for older callers: returns only the
-    first EID found (or the failure record). New code should call
-    extract_eids_from_source() instead, which handles multi-ID pages.
-    """
     results = extract_eids_from_source(image_path, source_file)
     return results[0]
-
