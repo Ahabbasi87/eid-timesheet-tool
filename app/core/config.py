@@ -1,4 +1,3 @@
-
 """
 Populates supplier timesheet templates from matched employees.
 
