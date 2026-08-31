@@ -41,6 +41,11 @@ class ExtractedID:
     raw_ocr_text: str = ""
     cleaned_eid: Optional[str] = None
     ocr_confidence: float = 0.0
+    # Best-effort fields read directly off the card - only reliably
+    # populated for single-card scans (see ocr_processor.py notes).
+    name: str = ""
+    date_of_issue: str = ""
+    date_of_expiry: str = ""
 
 
 @dataclass
@@ -51,6 +56,11 @@ class MatchResult:
     employee: Optional[MasterEmployee] = None
     supplier: Optional[str] = None
     notes: str = ""
+    # Populated for NEW_ARRIVAL results only - these come from OCR
+    # reading the card itself, since there's no master data record.
+    extracted_name: str = ""
+    extracted_date_of_issue: str = ""
+    extracted_date_of_expiry: str = ""
 
 
 @dataclass
