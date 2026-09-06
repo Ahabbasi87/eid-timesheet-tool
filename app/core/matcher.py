@@ -125,3 +125,4 @@ def match_extracted_ids(
             employee=employee,
             supplier=employee.supplier,
         ))
+return results, logs
