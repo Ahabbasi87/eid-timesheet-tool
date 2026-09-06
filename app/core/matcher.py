@@ -97,8 +97,8 @@ def match_extracted_ids(
         seen_eids[eid] = extracted.source_file
 
         # 5. Master data lookup
-          employee = master.get(eid)
-            if employee is None:
+        employee = master.get(eid)
+        if employee is None:
             results.append(MatchResult(
                 source_file=extracted.source_file,
                 extracted_eid=eid,
@@ -125,5 +125,3 @@ def match_extracted_ids(
             employee=employee,
             supplier=employee.supplier,
         ))
-
-    return results, logs
